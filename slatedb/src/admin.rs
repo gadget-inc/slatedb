@@ -2,7 +2,7 @@ use crate::checkpoint::{Checkpoint, CheckpointCreateResult};
 use crate::compactions_store::CompactionsStore;
 use crate::compactor::{Compaction, CompactionSpec, Compactor, CompactorStateView};
 use crate::compactor_state_protocols::CompactorStateReader;
-use crate::config::{CheckpointOptions, GarbageCollectorOptions};
+use crate::config::{CheckpointOptions, CloneOptions, GarbageCollectorOptions};
 use crate::db::builder::GarbageCollectorBuilder;
 use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
@@ -539,6 +539,7 @@ impl Admin {
     ///
     /// ```
     /// use slatedb::admin::{Admin, AdminBuilder};
+    /// use slatedb::config::CloneOptions;
     /// use slatedb::Db;
     /// use slatedb::object_store::{ObjectStore, memory::InMemory};
     /// use std::error::Error;
@@ -555,6 +556,7 @@ impl Admin {
     ///    admin.create_clone(
     ///      "parent_path",
     ///      None,
+    ///      &CloneOptions::default(),
     ///    ).await?;
     ///
     ///    Ok(())
@@ -564,12 +566,14 @@ impl Admin {
         &self,
         parent_path: P,
         parent_checkpoint: Option<Uuid>,
+        options: &CloneOptions,
     ) -> Result<(), Box<dyn Error>> {
         clone::create_clone(
             self.path.clone(),
             parent_path.into(),
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
             parent_checkpoint,
+            options,
             Arc::new(FailPointRegistry::new()),
             self.system_clock.clone(),
             self.rand.clone(),

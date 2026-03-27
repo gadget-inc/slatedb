@@ -1,5 +1,5 @@
 use crate::checkpoint::Checkpoint;
-use crate::config::CheckpointOptions;
+use crate::config::{CheckpointOptions, CloneOptions};
 use crate::db_state::{ManifestCore, SsTableId};
 use crate::error::SlateDBError;
 use crate::error::SlateDBError::CheckpointMissing;
@@ -20,6 +20,7 @@ pub(crate) async fn create_clone<P: Into<Path>>(
     parent_path: P,
     object_store: Arc<dyn ObjectStore>,
     parent_checkpoint: Option<Uuid>,
+    options: &CloneOptions,
     fp_registry: Arc<FailPointRegistry>,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
@@ -33,10 +34,6 @@ pub(crate) async fn create_clone<P: Into<Path>>(
 
     let clone_manifest_store = Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
     let parent_manifest_store = Arc::new(ManifestStore::new(&parent_path, object_store.clone()));
-    parent_manifest_store
-        .validate_no_wal_object_store_configured()
-        .await?;
-
     let mut clone_manifest = create_clone_manifest(
         clone_manifest_store,
         parent_manifest_store,
@@ -50,18 +47,35 @@ pub(crate) async fn create_clone<P: Into<Path>>(
     .await?;
 
     if !clone_manifest.db_state().initialized {
-        copy_wal_ssts(
-            object_store,
-            clone_manifest.db_state(),
-            &parent_path,
-            &clone_path,
-            fp_registry,
-        )
-        .await?;
+        if clone_manifest.db_state().wal_object_store_uri.is_some() {
+            if !options.skip_wal_ssts {
+                return Err(SlateDBError::CloneWalNotSkippable);
+            }
+            // The parent uses a separate WAL object store. WAL SSTs live on
+            // that store and are inaccessible via the main object store, so we
+            // skip copying them. Advance replay_after_wal_id so the clone will
+            // not attempt to replay WAL SSTs it cannot reach. Any data not yet
+            // flushed from WAL to L0 in the parent will be absent from the
+            // clone.
+            let mut dirty = clone_manifest.prepare_dirty()?;
+            let next = dirty.value.core.next_wal_sst_id;
+            dirty.value.core.replay_after_wal_id = next.saturating_sub(1);
+            dirty.value.core.initialized = true;
+            clone_manifest.update(dirty).await?;
+        } else {
+            copy_wal_ssts(
+                object_store,
+                clone_manifest.db_state(),
+                &parent_path,
+                &clone_path,
+                fp_registry,
+            )
+            .await?;
 
-        let mut dirty = clone_manifest.prepare_dirty()?;
-        dirty.value.core.initialized = true;
-        clone_manifest.update(dirty).await?;
+            let mut dirty = clone_manifest.prepare_dirty()?;
+            dirty.value.core.initialized = true;
+            clone_manifest.update(dirty).await?;
+        }
     }
 
     Ok(())
@@ -313,7 +327,9 @@ async fn copy_wal_ssts(
 #[cfg(test)]
 mod tests {
     use crate::clone::create_clone;
-    use crate::config::{CheckpointOptions, CheckpointScope, Settings};
+    use crate::config::{
+        CheckpointOptions, CheckpointScope, CloneOptions, FlushOptions, FlushType, Settings,
+    };
     use crate::db::Db;
     use crate::db_state::ManifestCore;
     use crate::error::SlateDBError;
@@ -353,6 +369,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             None,
+            &CloneOptions::default(),
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
@@ -418,6 +435,7 @@ mod tests {
             parent_path,
             object_store.clone(),
             Some(checkpoint.id),
+            &CloneOptions::default(),
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
@@ -469,6 +487,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             None,
+            &CloneOptions::default(),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
             rand.clone(),
@@ -529,6 +548,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             Some(checkpoint_2.id),
+            &CloneOptions::default(),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
             rand.clone(),
@@ -577,6 +597,7 @@ mod tests {
             updated_parent_path.clone(),
             object_store.clone(),
             None,
+            &CloneOptions::default(),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
             rand.clone(),
@@ -606,6 +627,7 @@ mod tests {
             parent_path,
             object_store.clone(),
             None,
+            &CloneOptions::default(),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
             rand.clone(),
@@ -622,6 +644,7 @@ mod tests {
             parent_path,
             object_store.clone(),
             None,
+            &CloneOptions::default(),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
             rand.clone(),
@@ -672,6 +695,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             None,
+            &CloneOptions::default(),
             Arc::clone(&fp_registry),
             system_clock.clone(),
             rand.clone(),
@@ -686,6 +710,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             None,
+            &CloneOptions::default(),
             Arc::clone(&fp_registry),
             system_clock.clone(),
             rand.clone(),
@@ -723,6 +748,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             Some(checkpoint.id),
+            &CloneOptions::default(),
             Arc::clone(&fp_registry),
             system_clock.clone(),
             rand.clone(),
@@ -751,6 +777,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             Some(checkpoint.id),
+            &CloneOptions::default(),
             Arc::clone(&fp_registry),
             system_clock.clone(),
             rand.clone(),
@@ -763,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clone_should_fail_if_wal_object_is_configured() {
+    async fn clone_should_fail_by_default_when_parent_has_separate_wal_store() {
         let object_store = Arc::new(InMemory::new());
         let wal_object_store = Arc::new(InMemory::new());
         let parent_path = "/tmp/test_parent";
@@ -781,14 +808,76 @@ mod tests {
             parent_path,
             object_store.clone(),
             None,
+            &CloneOptions::default(),
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(SlateDBError::WalStoreReconfigurationError)
-        ));
+        assert!(matches!(result, Err(SlateDBError::CloneWalNotSkippable)));
+    }
+
+    #[tokio::test]
+    async fn clone_should_succeed_with_skip_wal_ssts_and_data_is_readable() {
+        let mut rng = rng::new_test_rng(None);
+        let table = sample::table(&mut rng, 5000, 10);
+
+        let object_store = Arc::new(InMemory::new());
+        let wal_object_store = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent");
+        let clone_path = Path::from("/tmp/test_clone");
+
+        let parent_db = Db::builder(parent_path.clone(), object_store.clone())
+            .with_wal_object_store(wal_object_store)
+            .build()
+            .await
+            .unwrap();
+        test_utils::seed_database(&parent_db, &table, false)
+            .await
+            .unwrap();
+        // Flush memtables to L0 so data is on the main object store
+        parent_db
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        parent_db.close().await.unwrap();
+
+        create_clone(
+            clone_path.clone(),
+            parent_path.clone(),
+            object_store.clone(),
+            None,
+            &CloneOptions { skip_wal_ssts: true },
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+
+        // Verify the clone's WAL state was reset and URI preserved
+        let clone_manifest_store =
+            Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
+        let clone_manifest =
+            StoredManifest::load(clone_manifest_store, Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        let clone_state = clone_manifest.db_state();
+        assert!(clone_state.initialized);
+        assert_eq!(clone_state.replay_after_wal_id, clone_state.next_wal_sst_id - 1);
+        assert!(clone_state.wal_object_store_uri.is_some());
+
+        // Clone can be opened with a new WAL object store and data is readable
+        let clone_wal = Arc::new(InMemory::new());
+        let clone_db = Db::builder(clone_path.clone(), object_store.clone())
+            .with_wal_object_store(clone_wal)
+            .build()
+            .await
+            .unwrap();
+        let mut db_iter = clone_db.scan::<Vec<u8>, RangeFull>(..).await.unwrap();
+        test_utils::assert_ranged_db_scan(&table, .., &mut db_iter).await;
+        clone_db.close().await.unwrap();
     }
 }

@@ -72,6 +72,9 @@ pub(crate) enum SlateDBError {
     #[error("wal store reconfiguration unsupported")]
     WalStoreReconfigurationError,
 
+    #[error("cannot clone database with a separate WAL object store: WAL SSTs are not accessible from the main object store. Set skip_wal_ssts in CloneOptions to skip WAL SSTs (data not flushed to L0 will be absent from the clone)")]
+    CloneWalNotSkippable,
+
     #[error("invalid compaction")]
     InvalidCompaction,
 
@@ -497,6 +500,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidCachePartSize => Error::invalid(msg),
             SlateDBError::InvalidCompressionCodec => Error::invalid(msg),
             SlateDBError::WalStoreReconfigurationError => Error::invalid(msg),
+            SlateDBError::CloneWalNotSkippable => Error::invalid(msg),
             SlateDBError::InvalidConfigurationFormat(err) => {
                 Error::invalid(msg).with_source(Box::new(err))
             }

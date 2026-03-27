@@ -542,6 +542,18 @@ pub struct CheckpointOptions {
     pub name: Option<String>,
 }
 
+/// Options for cloning a database.
+#[derive(Debug, Clone, Default)]
+pub struct CloneOptions {
+    /// When true, allows cloning a database that uses a separate WAL object
+    /// store by skipping WAL SST copy. WAL SSTs on the separate store are not
+    /// accessible from the main object store, so they cannot be copied to the
+    /// clone. Any data not yet flushed from WAL to L0 will be absent from the
+    /// clone. The caller should ensure all data is flushed to L0 (e.g. via
+    /// `flush_with_options(FlushType::MemTable)`) before cloning.
+    pub skip_wal_ssts: bool,
+}
+
 /// Settings represents the configuration options that a user can tweak to customize
 /// the database engine to their use case.
 ///

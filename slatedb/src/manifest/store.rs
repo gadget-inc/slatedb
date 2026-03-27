@@ -581,17 +581,7 @@ impl ManifestStore {
         self.try_read_manifest(id).await?.ok_or(ManifestMissing(id))
     }
 
-    /// Validates that no dedicated WAL object store is configured in the latest
-    /// manifest of this `ManifestStore`.
-    ///
-    /// Used to disallow certain currently unsupported operations like cloning.
-    pub(crate) async fn validate_no_wal_object_store_configured(&self) -> Result<(), SlateDBError> {
-        let (_, manifest) = self.read_latest_manifest().await?;
-        if manifest.core.wal_object_store_uri.is_some() {
-            return Err(SlateDBError::WalStoreReconfigurationError);
-        }
-        Ok(())
-    }
+
 }
 
 #[cfg(test)]
