@@ -390,7 +390,7 @@ impl Admin {
             StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
 
         let manifest_has_wal = stored_manifest.db_state().wal_object_store_uri.is_some();
-        if self.object_stores.has_wal_object_store() != manifest_has_wal {
+        if manifest_has_wal && !self.object_stores.has_wal_object_store() {
             return Err(SlateDBError::WalStoreReconfigurationError.into());
         }
 

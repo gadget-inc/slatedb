@@ -442,9 +442,12 @@ impl<P: Into<Path>> DbBuilder<P> {
         let latest_manifest =
             StoredManifest::try_load(manifest_store.clone(), system_clock.clone()).await?;
 
-        // Validate WAL object store configuration
+        // Validate WAL object store configuration. Transitioning from None
+        // (e.g. a freshly cloned DB) to a new WAL store is allowed; it will be
+        // persisted when the manifest is initialized below.
         if let Some(latest_manifest) = &latest_manifest {
-            if latest_manifest.db_state().wal_object_store_uri != wal_object_store_uri {
+            let manifest_wal_uri = &latest_manifest.db_state().wal_object_store_uri;
+            if manifest_wal_uri.is_some() && *manifest_wal_uri != wal_object_store_uri {
                 return Err(SlateDBError::WalStoreReconfigurationError.into());
             }
         }
@@ -483,7 +486,18 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Initialize the database
         let stored_manifest = match latest_manifest {
-            Some(manifest) => manifest,
+            Some(mut manifest) => {
+                // Update WAL URI for databases (e.g. clones) that don't have one
+                // set yet but are now being opened with a WAL object store.
+                if manifest.db_state().wal_object_store_uri.is_none()
+                    && wal_object_store_uri.is_some()
+                {
+                    let mut dirty = manifest.prepare_dirty()?;
+                    dirty.value.core.wal_object_store_uri = wal_object_store_uri;
+                    manifest.update(dirty).await?;
+                }
+                manifest
+            }
             None => {
                 let state = ManifestCore::new_with_wal_object_store(wal_object_store_uri);
                 StoredManifest::create_new_db(manifest_store.clone(), state, system_clock.clone())
@@ -1294,12 +1308,14 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             None => retrying_object_store,
         };
 
-        // Validate WAL object store configuration.
+        // Validate WAL object store configuration. Transitioning from None
+        // (e.g. a freshly cloned DB) to a new WAL store is allowed.
         let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
         let latest_manifest =
             StoredManifest::try_load(manifest_store, self.system_clock.clone()).await?;
         if let Some(latest_manifest) = &latest_manifest {
-            if latest_manifest.db_state().wal_object_store_uri != wal_object_store_uri {
+            let manifest_wal_uri = &latest_manifest.db_state().wal_object_store_uri;
+            if manifest_wal_uri.is_some() && *manifest_wal_uri != wal_object_store_uri {
                 return Err(SlateDBError::WalStoreReconfigurationError.into());
             }
         }

@@ -809,6 +809,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clone_should_succeed_with_data_when_wal_object_store_is_provided() {
+        let mut rng = rng::new_test_rng(None);
+        let table = sample::table(&mut rng, 5000, 10);
+
+        let object_store = Arc::new(InMemory::new());
+        let wal_object_store = Arc::new(InMemory::new());
+        let parent_path = "/tmp/test_parent";
+        let clone_path = "/tmp/test_clone";
+
+        let parent_db = Db::builder(parent_path, object_store.clone())
+            .with_wal_object_store(wal_object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        test_utils::seed_database(&parent_db, &table, false)
+            .await
+            .unwrap();
+        parent_db.flush().await.unwrap();
+        parent_db.close().await.unwrap();
+
+        create_clone(
+            clone_path,
+            parent_path,
+            object_store.clone(),
+            wal_object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+
+        // Clone opens with the same WAL store and can read all parent data
+        let clone_db = Db::builder(clone_path, object_store.clone())
+            .with_wal_object_store(wal_object_store)
+            .build()
+            .await
+            .unwrap();
+        let mut db_iter = clone_db.scan::<Vec<u8>, RangeFull>(..).await.unwrap();
+        test_utils::assert_ranged_db_scan(&table, .., &mut db_iter).await;
+        clone_db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn clone_wal_writes_go_to_new_wal_store() {
         use futures::TryStreamExt;
         use object_store::ObjectStore;
