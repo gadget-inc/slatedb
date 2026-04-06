@@ -8,6 +8,7 @@ use crate::paths::PathResolver;
 use crate::rand::DbRand;
 use crate::utils::IdGenerator;
 use fail_parallel::{fail_point, FailPointRegistry};
+use log::warn;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use slatedb_common::clock::SystemClock;
@@ -49,7 +50,7 @@ pub(crate) async fn create_clone<P: Into<Path>>(
     .await?;
 
     if !clone_manifest.db_state().initialized {
-        copy_wal_ssts(
+        let replay_after_wal_id = copy_wal_ssts(
             parent_wal_object_store,
             clone_wal_object_store,
             clone_manifest.db_state(),
@@ -61,6 +62,7 @@ pub(crate) async fn create_clone<P: Into<Path>>(
 
         let mut dirty = clone_manifest.prepare_dirty()?;
         dirty.value.core.initialized = true;
+        dirty.value.core.replay_after_wal_id = replay_after_wal_id;
         clone_manifest.update(dirty).await?;
     }
 
@@ -282,6 +284,12 @@ async fn load_initialized_manifest(
     Ok(manifest)
 }
 
+/// Copy WAL SSTs from the parent's WAL store to the clone's WAL store.
+///
+/// Returns the adjusted `replay_after_wal_id` for the clone. WAL SSTs that
+/// have already been flushed to L0 and cleaned up from the parent's WAL store
+/// are skipped, and `replay_after_wal_id` is advanced past them so the clone
+/// does not attempt to replay missing files.
 async fn copy_wal_ssts(
     parent_wal_store: Arc<dyn ObjectStore>,
     clone_wal_store: Arc<dyn ObjectStore>,
@@ -289,29 +297,61 @@ async fn copy_wal_ssts(
     parent_path: &Path,
     clone_path: &Path,
     #[allow(unused)] fp_registry: Arc<FailPointRegistry>,
-) -> Result<(), SlateDBError> {
+) -> Result<u64, SlateDBError> {
     let parent_path_resolver = PathResolver::new(parent_path.clone());
     let clone_path_resolver = PathResolver::new(clone_path.clone());
     let same_store = Arc::ptr_eq(&parent_wal_store, &clone_wal_store);
 
     let mut wal_id = parent_checkpoint_state.replay_after_wal_id + 1;
+    let mut replay_after_wal_id = parent_checkpoint_state.replay_after_wal_id;
+    let mut found_existing_wal = false;
+
     while wal_id < parent_checkpoint_state.next_wal_sst_id {
         fail_point!(fp_registry.clone(), "copy-wal-ssts-io-error", |_| Err(
             SlateDBError::from(std::io::Error::other("oops"))
         ));
 
         let id = SsTableId::Wal(wal_id);
-        let parent_path = parent_path_resolver.table_path(&id);
-        let clone_path = clone_path_resolver.table_path(&id);
-        if same_store {
-            parent_wal_store.copy(&parent_path, &clone_path).await?;
+        let parent_sst_path = parent_path_resolver.table_path(&id);
+        let clone_sst_path = clone_path_resolver.table_path(&id);
+
+        let copy_result: Result<(), object_store::Error> = if same_store {
+            parent_wal_store
+                .copy(&parent_sst_path, &clone_sst_path)
+                .await
         } else {
-            let data = parent_wal_store.get(&parent_path).await?.bytes().await?;
-            clone_wal_store.put(&clone_path, data.into()).await?;
+            match parent_wal_store.get(&parent_sst_path).await {
+                Ok(get_result) => {
+                    let data = get_result.bytes().await?;
+                    clone_wal_store
+                        .put(&clone_sst_path, data.into())
+                        .await
+                        .map(|_| ())
+                }
+                Err(e) => Err(e),
+            }
+        };
+
+        match copy_result {
+            Ok(()) => {
+                found_existing_wal = true;
+            }
+            Err(object_store::Error::NotFound { .. }) if !found_existing_wal => {
+                // This WAL SST was already flushed to L0 and cleaned up from the
+                // parent's WAL store. Advance replay_after_wal_id past it so the
+                // clone won't try to replay a file that doesn't exist.
+                warn!(
+                    "WAL SST {} not found in parent WAL store, skipping (data already in L0)",
+                    wal_id
+                );
+                replay_after_wal_id = wal_id;
+            }
+            Err(e) => return Err(SlateDBError::from(e)),
         }
+
         wal_id += 1;
     }
-    Ok(())
+    Ok(replay_after_wal_id)
 }
 
 #[cfg(test)]
@@ -328,8 +368,10 @@ mod tests {
     use crate::test_utils;
     use crate::utils::IdGenerator;
     use fail_parallel::FailPointRegistry;
+    use futures::TryStreamExt;
     use object_store::memory::InMemory;
     use object_store::path::Path;
+    use object_store::ObjectStore;
     use slatedb_common::clock::DefaultSystemClock;
     use std::ops::RangeFull;
     use std::sync::Arc;
@@ -1021,7 +1063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clone_should_fail_when_wal_store_is_not_provided() {
+    async fn clone_should_skip_missing_wal_ssts_when_flushed() {
         let object_store = Arc::new(InMemory::new());
         let wal_object_store = Arc::new(InMemory::new());
         let parent_path = "/tmp/test_parent";
@@ -1034,8 +1076,10 @@ mod tests {
             .unwrap();
         parent_db.close().await.unwrap();
 
-        // Pass main store as parent WAL store — WAL SSTs won't be found there
-        let result = create_clone(
+        // Pass main store as parent WAL store — WAL SSTs won't be found there,
+        // but since the data was already flushed to L0, the clone should succeed
+        // by advancing replay_after_wal_id past the missing WALs.
+        create_clone(
             clone_path,
             parent_path,
             object_store.clone(),
@@ -1046,7 +1090,135 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
         )
+        .await
+        .unwrap();
+
+        // The clone should be openable and usable
+        let clone_db = Db::open(clone_path, object_store.clone()).await.unwrap();
+        clone_db.close().await.unwrap();
+    }
+
+    /// Simulates the silo split scenario: parent writes data, flushes everything
+    /// to L0, WAL store is cleaned up, then clone is created. The clone should
+    /// succeed because copy_wal_ssts tolerates missing WAL SSTs whose data is
+    /// already in L0.
+    #[tokio::test]
+    async fn clone_should_succeed_when_parent_wal_cleaned_up_after_flush() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent");
+        let clone_path = Path::from("/tmp/test_clone");
+
+        // Write data to the parent
+        let parent_db = Db::builder(parent_path.clone(), object_store.clone())
+            .with_wal_object_store(wal_object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        parent_db.put(b"key1", b"value1").await.unwrap();
+        parent_db.put(b"key2", b"value2").await.unwrap();
+
+        // Flush everything to L0 (like silo's apply_wal_on_close)
+        parent_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        parent_db.close().await.unwrap();
+
+        // Clean up the parent's WAL store (simulating silo cleaning up local disk)
+        let wal_path = crate::paths::PathResolver::new(parent_path.clone()).wal_path();
+        let wal_files: Vec<_> = wal_object_store
+            .list(Some(&wal_path))
+            .try_collect()
+            .await
+            .unwrap();
+        for file in &wal_files {
+            wal_object_store.delete(&file.location).await.unwrap();
+        }
+
+        // Create a clone — should succeed despite missing WAL SSTs
+        create_clone(
+            clone_path.clone(),
+            parent_path.clone(),
+            object_store.clone(),
+            wal_object_store.clone(),
+            wal_object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+
+        // The clone should have all the data
+        let clone_db = Db::builder(clone_path, object_store.clone())
+            .with_wal_object_store(wal_object_store)
+            .build()
+            .await
+            .unwrap();
+        let val1 = clone_db.get(b"key1").await.unwrap();
+        assert_eq!(val1.as_deref(), Some(b"value1".as_ref()));
+        let val2 = clone_db.get(b"key2").await.unwrap();
+        assert_eq!(val2.as_deref(), Some(b"value2".as_ref()));
+        clone_db.close().await.unwrap();
+    }
+
+    /// When a WAL SST is missing AFTER an existing one (a gap in the middle),
+    /// that indicates actual data loss — not a post-flush cleanup. The clone
+    /// should fail.
+    #[tokio::test]
+    async fn clone_should_fail_when_wal_sst_missing_after_existing() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent");
+        let clone_path = Path::from("/tmp/test_clone");
+
+        // Open parent, write data, close. This creates WAL SSTs without
+        // flushing memtables to L0, so the WAL SSTs are in the copy range.
+        let parent_db = Db::builder(parent_path.clone(), object_store.clone())
+            .with_wal_object_store(wal_object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        parent_db.put(b"key1", b"value1").await.unwrap();
+        parent_db.close().await.unwrap();
+
+        // List the parent's WAL SSTs and verify there are at least 2
+        // (fencing WAL + data WAL).
+        let wal_path = crate::paths::PathResolver::new(parent_path.clone()).wal_path();
+        let mut wal_files: Vec<_> = wal_object_store
+            .list(Some(&wal_path))
+            .try_collect()
+            .await
+            .unwrap();
+        wal_files.sort_by_key(|f| f.location.clone());
+        assert!(
+            wal_files.len() >= 2,
+            "expected at least 2 WAL SSTs, got {}",
+            wal_files.len()
+        );
+
+        // Delete the LAST WAL SST, creating a gap after the earlier existing ones.
+        let last_wal = wal_files.last().unwrap();
+        wal_object_store
+            .delete(&last_wal.location)
+            .await
+            .unwrap();
+
+        // Clone should fail — a missing WAL after an existing one is data loss.
+        let result = create_clone(
+            clone_path,
+            parent_path,
+            object_store.clone(),
+            wal_object_store.clone(),
+            wal_object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
         .await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "clone should fail when WAL SST is missing after an existing one");
     }
 }
