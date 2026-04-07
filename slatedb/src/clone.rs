@@ -19,7 +19,8 @@ pub(crate) async fn create_clone<P: Into<Path>>(
     clone_path: P,
     parent_path: P,
     object_store: Arc<dyn ObjectStore>,
-    wal_object_store: Arc<dyn ObjectStore>,
+    parent_wal_object_store: Arc<dyn ObjectStore>,
+    clone_wal_object_store: Arc<dyn ObjectStore>,
     parent_checkpoint: Option<Uuid>,
     fp_registry: Arc<FailPointRegistry>,
     system_clock: Arc<dyn SystemClock>,
@@ -49,7 +50,8 @@ pub(crate) async fn create_clone<P: Into<Path>>(
 
     if !clone_manifest.db_state().initialized {
         copy_wal_ssts(
-            wal_object_store,
+            parent_wal_object_store,
+            clone_wal_object_store,
             clone_manifest.db_state(),
             &parent_path,
             &clone_path,
@@ -281,7 +283,8 @@ async fn load_initialized_manifest(
 }
 
 async fn copy_wal_ssts(
-    object_store: Arc<dyn ObjectStore>,
+    parent_wal_store: Arc<dyn ObjectStore>,
+    clone_wal_store: Arc<dyn ObjectStore>,
     parent_checkpoint_state: &ManifestCore,
     parent_path: &Path,
     clone_path: &Path,
@@ -289,6 +292,7 @@ async fn copy_wal_ssts(
 ) -> Result<(), SlateDBError> {
     let parent_path_resolver = PathResolver::new(parent_path.clone());
     let clone_path_resolver = PathResolver::new(clone_path.clone());
+    let same_store = Arc::ptr_eq(&parent_wal_store, &clone_wal_store);
 
     let mut wal_id = parent_checkpoint_state.replay_after_wal_id + 1;
     while wal_id < parent_checkpoint_state.next_wal_sst_id {
@@ -299,10 +303,12 @@ async fn copy_wal_ssts(
         let id = SsTableId::Wal(wal_id);
         let parent_path = parent_path_resolver.table_path(&id);
         let clone_path = clone_path_resolver.table_path(&id);
-        object_store
-            .as_ref()
-            .copy(&parent_path, &clone_path)
-            .await?;
+        if same_store {
+            parent_wal_store.copy(&parent_path, &clone_path).await?;
+        } else {
+            let data = parent_wal_store.get(&parent_path).await?.bytes().await?;
+            clone_wal_store.put(&clone_path, data.into()).await?;
+        }
         wal_id += 1;
     }
     Ok(())
@@ -327,9 +333,11 @@ mod tests {
     use crate::utils::IdGenerator;
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
+    use futures::TryStreamExt;
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::Error as ObjectStoreError;
+    use object_store::ObjectStore;
     use slatedb_common::clock::DefaultSystemClock;
     use std::ops::RangeFull;
     use std::sync::Arc;
@@ -355,6 +363,7 @@ mod tests {
         create_clone(
             clone_path.clone(),
             parent_path.clone(),
+            object_store.clone(),
             object_store.clone(),
             object_store.clone(),
             None,
@@ -423,6 +432,7 @@ mod tests {
             parent_path,
             object_store.clone(),
             object_store.clone(),
+            object_store.clone(),
             Some(checkpoint.id),
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
@@ -473,6 +483,7 @@ mod tests {
         let err = create_clone(
             clone_path.clone(),
             parent_path.clone(),
+            object_store.clone(),
             object_store.clone(),
             object_store.clone(),
             None,
@@ -536,6 +547,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             object_store.clone(),
+            object_store.clone(),
             Some(checkpoint_2.id),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
@@ -585,6 +597,7 @@ mod tests {
             updated_parent_path.clone(),
             object_store.clone(),
             object_store.clone(),
+            object_store.clone(),
             None,
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
@@ -615,6 +628,7 @@ mod tests {
             parent_path,
             object_store.clone(),
             object_store.clone(),
+            object_store.clone(),
             None,
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
@@ -630,6 +644,7 @@ mod tests {
         create_clone(
             clone_path,
             parent_path,
+            object_store.clone(),
             object_store.clone(),
             object_store.clone(),
             None,
@@ -683,6 +698,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             object_store.clone(),
+            object_store.clone(),
             None,
             Arc::clone(&fp_registry),
             system_clock.clone(),
@@ -696,6 +712,7 @@ mod tests {
         create_clone(
             clone_path.clone(),
             parent_path.clone(),
+            object_store.clone(),
             object_store.clone(),
             object_store.clone(),
             None,
@@ -736,6 +753,7 @@ mod tests {
             parent_path.clone(),
             object_store.clone(),
             object_store.clone(),
+            object_store.clone(),
             Some(checkpoint.id),
             Arc::clone(&fp_registry),
             system_clock.clone(),
@@ -763,6 +781,7 @@ mod tests {
         let err = create_clone(
             clone_path.clone(),
             parent_path.clone(),
+            object_store.clone(),
             object_store.clone(),
             object_store.clone(),
             Some(checkpoint.id),
@@ -837,6 +856,7 @@ mod tests {
             parent_path,
             object_store.clone(),
             wal_object_store.clone(),
+            wal_object_store.clone(),
             None,
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
@@ -862,6 +882,200 @@ mod tests {
                 Some(Bytes::copy_from_slice(value))
             );
         }
+        clone_db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clone_should_succeed_with_data_when_wal_object_store_is_provided() {
+        let mut rng = rng::new_test_rng(None);
+        let table = sample::table(&mut rng, 5000, 10);
+
+        let object_store = Arc::new(InMemory::new());
+        let wal_object_store = Arc::new(InMemory::new());
+        let parent_path = "/tmp/test_parent";
+        let clone_path = "/tmp/test_clone";
+
+        let parent_db = Db::builder(parent_path, object_store.clone())
+            .with_wal_object_store(wal_object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        test_utils::seed_database(&parent_db, &table, false)
+            .await
+            .unwrap();
+        parent_db.flush().await.unwrap();
+        parent_db.close().await.unwrap();
+
+        create_clone(
+            clone_path,
+            parent_path,
+            object_store.clone(),
+            wal_object_store.clone(),
+            wal_object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+
+        // Clone opens with the same WAL store and can read all parent data
+        let clone_db = Db::builder(clone_path, object_store.clone())
+            .with_wal_object_store(wal_object_store)
+            .build()
+            .await
+            .unwrap();
+        let mut db_iter = clone_db.scan::<Vec<u8>, RangeFull>(..).await.unwrap();
+        test_utils::assert_ranged_db_scan(&table, .., &mut db_iter).await;
+        clone_db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clone_wal_writes_go_to_new_wal_store() {
+        use futures::TryStreamExt;
+        use object_store::ObjectStore;
+
+        let mut rng = rng::new_test_rng(None);
+        let parent_table = sample::table(&mut rng, 5000, 10);
+
+        let object_store = Arc::new(InMemory::new());
+        let parent_wal_store = Arc::new(InMemory::new());
+        let parent_path = "/tmp/test_parent";
+        let clone_path = "/tmp/test_clone";
+
+        // Create parent with split WAL, seed data, flush, and checkpoint
+        // (mirrors the user's flow: open → flush → checkpoint → clone → close)
+        let parent_db = Db::builder(parent_path, object_store.clone())
+            .with_wal_object_store(parent_wal_store.clone())
+            .build()
+            .await
+            .unwrap();
+        test_utils::seed_database(&parent_db, &parent_table, false)
+            .await
+            .unwrap();
+        let checkpoint = parent_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+
+        // Clone from the checkpoint (all data flushed to L0, no WAL SSTs to replay)
+        let clone_wal_store = Arc::new(InMemory::new());
+        create_clone(
+            clone_path,
+            parent_path,
+            object_store.clone(),
+            parent_wal_store.clone(),
+            clone_wal_store.clone(),
+            Some(checkpoint.id),
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+        parent_db.close().await.unwrap();
+
+        // Open clone with the clone's WAL store
+        let clone_db = Db::builder(clone_path, object_store.clone())
+            .with_wal_object_store(clone_wal_store.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // Verify parent data is readable from the clone
+        let mut db_iter = clone_db.scan::<Vec<u8>, RangeFull>(..).await.unwrap();
+        test_utils::assert_ranged_db_scan(&parent_table, .., &mut db_iter).await;
+
+        // Write new data to the clone and flush so WAL SSTs are written
+        clone_db.put(b"clone_key", b"clone_value").await.unwrap();
+        clone_db.flush().await.unwrap();
+        clone_db.close().await.unwrap();
+
+        // Verify WAL SSTs landed in the clone's WAL store, not the parent's
+        let clone_wal_path = Path::from(format!("{}/wal/", clone_path));
+        let clone_wal_files: Vec<_> = clone_wal_store
+            .list(Some(&clone_wal_path))
+            .map_ok(|m| m.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            !clone_wal_files.is_empty(),
+            "expected WAL SSTs in the clone's WAL store, found none"
+        );
+
+        // Verify nothing was written to the parent's WAL store at the clone path
+        let parent_wal_clone_files: Vec<_> = parent_wal_store
+            .list(Some(&clone_wal_path))
+            .map_ok(|m| m.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            parent_wal_clone_files.is_empty(),
+            "expected no WAL SSTs for clone path in parent WAL store, found {:?}",
+            parent_wal_clone_files
+        );
+
+        // Reopen the clone and verify all data (parent + clone writes) is readable
+        let clone_db = Db::builder(clone_path, object_store.clone())
+            .with_wal_object_store(clone_wal_store)
+            .build()
+            .await
+            .unwrap();
+        let val = clone_db.get(b"clone_key").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"clone_value".as_slice()));
+        clone_db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clone_cross_store_wal_copy() {
+        let mut rng = rng::new_test_rng(None);
+        let table = sample::table(&mut rng, 5000, 10);
+
+        let object_store = Arc::new(InMemory::new());
+        let parent_wal_store = Arc::new(InMemory::new());
+        let clone_wal_store = Arc::new(InMemory::new());
+        let parent_path = "/tmp/test_parent";
+        let clone_path = "/tmp/test_clone";
+
+        // Create parent with split WAL and seed data without full flush,
+        // so WAL SSTs exist that need to be copied.
+        let parent_db = Db::builder(parent_path, object_store.clone())
+            .with_wal_object_store(parent_wal_store.clone())
+            .build()
+            .await
+            .unwrap();
+        test_utils::seed_database(&parent_db, &table, false)
+            .await
+            .unwrap();
+        parent_db.flush().await.unwrap();
+        parent_db.close().await.unwrap();
+
+        // Clone with different WAL stores for parent (read) and clone (write)
+        create_clone(
+            clone_path,
+            parent_path,
+            object_store.clone(),
+            parent_wal_store.clone(),
+            clone_wal_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+
+        // Open the clone with its own WAL store and verify all data is readable
+        let clone_db = Db::builder(clone_path, object_store.clone())
+            .with_wal_object_store(clone_wal_store)
+            .build()
+            .await
+            .unwrap();
+        let mut db_iter = clone_db.scan::<Vec<u8>, RangeFull>(..).await.unwrap();
+        test_utils::assert_ranged_db_scan(&table, .., &mut db_iter).await;
         clone_db.close().await.unwrap();
     }
 
@@ -923,10 +1137,11 @@ mod tests {
             .to_string();
         parent_db.close().await.unwrap();
 
-        // Pass main store as WAL store — WAL SSTs won't be found there
+        // Pass main store as parent WAL store — WAL SSTs won't be found there
         let err = create_clone(
             clone_path,
             parent_path,
+            object_store.clone(),
             object_store.clone(),
             object_store.clone(),
             None,
@@ -944,5 +1159,182 @@ mod tests {
                     ObjectStoreError::NotFound { path, .. } if path == &expected_missing_wal_path
                 )
         ));
+    }
+
+    /// Clone replays parent WAL SSTs, writes new data, flushes, and survives
+    /// a close/reopen cycle. Covers WAL replay on clone, continued writes after
+    /// replay, gap closure on CheckpointScope::All, and durability.
+    #[tokio::test]
+    async fn clone_replays_wal_and_continues_writing() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent");
+        let clone_path = Path::from("/tmp/test_clone");
+
+        // Parent writes data with a Durable checkpoint (WAL gap exists)
+        let parent_db = Db::builder(parent_path.clone(), object_store.clone())
+            .with_wal_object_store(wal_object_store.clone())
+            .with_settings(Settings {
+                flush_interval: Some(std::time::Duration::from_millis(5000)),
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        parent_db.put(b"key1", b"value1").await.unwrap();
+        parent_db.put(b"key2", b"value2").await.unwrap();
+        parent_db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        parent_db.close().await.unwrap();
+
+        // Create clone — WAL SSTs are copied
+        create_clone(
+            clone_path.clone(),
+            parent_path,
+            object_store.clone(),
+            wal_object_store.clone(),
+            wal_object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::default()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+
+        // Open clone (replays WALs), write more data, flush everything
+        let clone_db = Db::builder(clone_path.clone(), object_store.clone())
+            .with_wal_object_store(wal_object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        clone_db.put(b"key3", b"value3").await.unwrap();
+        clone_db.put(b"key4", b"value4").await.unwrap();
+
+        let checkpoint = clone_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+
+        // WAL gap should be closed after full flush
+        let manifest_store = ManifestStore::new(&clone_path, object_store.clone());
+        let manifest = manifest_store
+            .read_manifest(checkpoint.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.core.replay_after_wal_id,
+            manifest.core.next_wal_sst_id - 1,
+        );
+
+        // All 4 keys present (2 replayed from parent WAL + 2 written on clone)
+        assert_eq!(
+            clone_db.get(b"key1").await.unwrap().as_deref(),
+            Some(b"value1".as_ref())
+        );
+        assert_eq!(
+            clone_db.get(b"key2").await.unwrap().as_deref(),
+            Some(b"value2".as_ref())
+        );
+        assert_eq!(
+            clone_db.get(b"key3").await.unwrap().as_deref(),
+            Some(b"value3".as_ref())
+        );
+        assert_eq!(
+            clone_db.get(b"key4").await.unwrap().as_deref(),
+            Some(b"value4".as_ref())
+        );
+
+        // Close and reopen — all data survives
+        clone_db.close().await.unwrap();
+        let clone_db = Db::builder(clone_path, object_store)
+            .with_wal_object_store(wal_object_store)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            clone_db.get(b"key1").await.unwrap().as_deref(),
+            Some(b"value1".as_ref())
+        );
+        assert_eq!(
+            clone_db.get(b"key2").await.unwrap().as_deref(),
+            Some(b"value2".as_ref())
+        );
+        assert_eq!(
+            clone_db.get(b"key3").await.unwrap().as_deref(),
+            Some(b"value3".as_ref())
+        );
+        assert_eq!(
+            clone_db.get(b"key4").await.unwrap().as_deref(),
+            Some(b"value4".as_ref())
+        );
+        clone_db.close().await.unwrap();
+    }
+
+    /// After CheckpointScope::All flushes and closes the WAL gap, external
+    /// cleanup of the parent's WAL store should not break cloning.
+    #[tokio::test]
+    async fn clone_succeeds_after_parent_wal_cleanup() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent");
+        let clone_path = Path::from("/tmp/test_clone");
+
+        let parent_db = Db::builder(parent_path.clone(), object_store.clone())
+            .with_wal_object_store(wal_object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        parent_db.put(b"key1", b"value1").await.unwrap();
+        parent_db.put(b"key2", b"value2").await.unwrap();
+        parent_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        parent_db.close().await.unwrap();
+
+        // Simulate external WAL cleanup (silo cleaning local disk / pod death)
+        let wal_path = crate::paths::PathResolver::new(parent_path.clone()).wal_path();
+        let wal_files: Vec<_> = wal_object_store
+            .list(Some(&wal_path))
+            .try_collect()
+            .await
+            .unwrap();
+        for file in &wal_files {
+            wal_object_store.delete(&file.location).await.unwrap();
+        }
+
+        // Clone succeeds — no WAL gap to copy
+        create_clone(
+            clone_path.clone(),
+            parent_path,
+            object_store.clone(),
+            wal_object_store.clone(),
+            wal_object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::default()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+
+        // Clone has all the data
+        let clone_db = Db::builder(clone_path, object_store)
+            .with_wal_object_store(wal_object_store)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            clone_db.get(b"key1").await.unwrap().as_deref(),
+            Some(b"value1".as_ref())
+        );
+        assert_eq!(
+            clone_db.get(b"key2").await.unwrap().as_deref(),
+            Some(b"value2".as_ref())
+        );
+        clone_db.close().await.unwrap();
     }
 }

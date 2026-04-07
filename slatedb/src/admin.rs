@@ -389,7 +389,7 @@ impl Admin {
             StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
 
         let manifest_has_wal = stored_manifest.db_state().wal_object_store_uri.is_some();
-        if self.object_stores.has_wal_object_store() != manifest_has_wal {
+        if manifest_has_wal && !self.object_stores.has_wal_object_store() {
             return Err(SlateDBError::WalStoreReconfigurationError.into());
         }
 
@@ -534,6 +534,11 @@ impl Admin {
     /// as the base for the clone db's manifest. Otherwise, this method creates a new checkpoint
     /// for the current version of the parent db.
     ///
+    /// When the parent database uses a separate WAL object store, pass it as
+    /// `parent_wal_object_store` so the clone can read the parent's WAL SSTs.
+    /// If `None`, the admin's own WAL store (or main store) is used for both
+    /// reading and writing WAL SSTs.
+    ///
     /// # Examples
     ///
     /// ```
@@ -554,6 +559,7 @@ impl Admin {
     ///    admin.create_clone(
     ///      "parent_path",
     ///      None,
+    ///      None,
     ///    ).await?;
     ///
     ///    Ok(())
@@ -563,12 +569,17 @@ impl Admin {
         &self,
         parent_path: P,
         parent_checkpoint: Option<Uuid>,
+        parent_wal_object_store: Option<Arc<dyn ObjectStore>>,
     ) -> Result<(), Box<dyn Error>> {
+        let parent_wal = parent_wal_object_store
+            .unwrap_or_else(|| self.object_stores.store_of(ObjectStoreType::Wal).clone());
+        let clone_wal = self.object_stores.store_of(ObjectStoreType::Wal).clone();
         clone::create_clone(
             self.path.clone(),
             parent_path.into(),
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
-            self.object_stores.store_of(ObjectStoreType::Wal).clone(),
+            parent_wal,
+            clone_wal,
             parent_checkpoint,
             Arc::new(FailPointRegistry::new()),
             self.system_clock.clone(),

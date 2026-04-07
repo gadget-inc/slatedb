@@ -570,6 +570,9 @@ impl ManifestCore {
         let mut clone = self.clone();
         clone.initialized = false;
         clone.checkpoints.clear();
+        // The clone is a new database with its own WAL configuration.
+        // The parent's WAL URI should not carry over.
+        clone.wal_object_store_uri = None;
         clone
     }
 

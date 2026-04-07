@@ -40,6 +40,21 @@ impl Db {
                 self.inner.flush_wals().await?;
             }
             self.inner.flush_memtables().await?;
+
+            // All data is now in L0. Advance replay_after_wal_id past any
+            // remaining WAL SSTs (e.g. the empty fencing WAL from Db::open)
+            // so checkpoints/clones don't reference WAL files that may be
+            // garbage-collected.
+            {
+                let mut guard = self.inner.state.write();
+                guard.modify(|modifier| {
+                    let core = &mut modifier.state.manifest.value.core;
+                    let target = core.next_wal_sst_id.saturating_sub(1);
+                    if core.replay_after_wal_id < target {
+                        core.replay_after_wal_id = target;
+                    }
+                });
+            }
         }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -551,5 +566,80 @@ mod tests {
         // List checkpoints filtered by non-existent name
         let filtered_checkpoints = admin.list_checkpoints(Some("non_existent")).await.unwrap();
         assert_eq!(filtered_checkpoints.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_scope_all_closes_wal_gap() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_kv_store");
+        let db = Db::builder(path.clone(), object_store.clone())
+            .with_wal_object_store(wal_object_store)
+            .with_settings(Settings {
+                flush_interval: Some(Duration::from_millis(5000)),
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        db.put(b"key1", b"value1").await.unwrap();
+
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+
+        let manifest_store = ManifestStore::new(&path, object_store.clone());
+        let manifest = manifest_store
+            .read_manifest(checkpoint.manifest_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manifest.core.replay_after_wal_id,
+            manifest.core.next_wal_sst_id - 1,
+            "CheckpointScope::All should close the WAL gap"
+        );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_wal_replay_needed_without_full_flush() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_kv_store");
+        let db = Db::builder(path.clone(), object_store.clone())
+            .with_wal_object_store(wal_object_store)
+            .with_settings(Settings {
+                flush_interval: Some(Duration::from_millis(5000)),
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        db.put(b"key1", b"value1").await.unwrap();
+
+        // Durable checkpoint — no memtable flush to L0
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .unwrap();
+
+        let manifest_store = ManifestStore::new(&path, object_store.clone());
+        let manifest = manifest_store
+            .read_manifest(checkpoint.manifest_id)
+            .await
+            .unwrap();
+
+        // WAL SSTs should still be referenced (gap exists, replay needed)
+        assert!(
+            manifest.core.replay_after_wal_id < manifest.core.next_wal_sst_id - 1,
+            "CheckpointScope::Durable should NOT close the WAL gap"
+        );
+
+        db.close().await.unwrap();
     }
 }
